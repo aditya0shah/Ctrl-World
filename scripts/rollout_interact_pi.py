@@ -11,7 +11,7 @@ from accelerate import Accelerator
 import torch
 from diffusers import StableVideoDiffusionPipeline
 import numpy as np
-# import cv2
+import cv2
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -89,6 +89,72 @@ class agent():
     ) -> np.ndarray:
         ndata = 2 * (data - data_min) / (data_max - data_min + eps) - 1
         return np.clip(ndata, clip_min, clip_max)
+
+    def init_from_images(self, image_paths, joint_position, cartesian_position=None, gripper_position=None):
+        """
+        Initialize from initial images and joint state.
+        
+        Args:
+            image_paths: List of paths to initial images (e.g., ['ext_1.png', 'ext_2.png', 'wrist.png'])
+            joint_position: Initial joint positions (7 values)
+            cartesian_position: Initial cartesian pose (6 values: xyz + euler) or None to compute from FK
+            gripper_position: Initial gripper position (1 value) or None to use 0.0
+        
+        Returns:
+            video_dict: List of initial video frames (numpy arrays)
+            video_latents: List of encoded latents
+            initial_eef: Initial end-effector pose (7 values: xyz + euler + gripper)
+            initial_joint: Initial joint state (8 values: 7 joints + gripper)
+        """
+        import cv2
+        
+        # Load and encode images
+        video_dict = []
+        video_latent = []
+        
+        for img_path in image_paths:
+            # Load image
+            img = cv2.imread(img_path)
+            if img is None:
+                raise ValueError(f"Could not load image: {img_path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Resize to expected dimensions (height x width from config)
+            target_h, target_w = self.args.height, self.args.width
+            img_resized = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            video_dict.append(img_resized[None, ...])  # Add time dimension: (1, H, W, 3)
+            
+            # Encode to latent
+            device = self.device
+            img_tensor = torch.from_numpy(img_resized).to(self.dtype).to(device)
+            x = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device) / 255.0 * 2 - 1  # (1, 3, H, W)
+            vae = self.model.pipeline.vae
+            with torch.no_grad():
+                latent = vae.encode(x).latent_dist.sample().mul_(vae.config.scaling_factor)
+            video_latent.append(latent)
+        
+        # Compute initial end-effector pose if not provided
+        if cartesian_position is None:
+            from scipy.spatial.transform import Rotation as R
+            current_state_fk = get_fk_solution(joint_position[:7])
+            xyz = current_state_fk[:3, 3]
+            rotation_matrix = current_state_fk[:3, :3]
+            r = R.from_matrix(rotation_matrix)
+            euler = r.as_euler('xyz')
+            initial_eef = np.concatenate([xyz, euler], axis=0)
+        else:
+            initial_eef = np.array(cartesian_position)
+        
+        # Add gripper position
+        if gripper_position is None:
+            gripper_pos = 0.0
+        else:
+            gripper_pos = gripper_position[0] if isinstance(gripper_position, (list, np.ndarray)) else gripper_position
+        
+        initial_eef = np.concatenate([initial_eef, [gripper_pos]])  # (7,)
+        initial_joint = np.concatenate([joint_position[:7], [gripper_pos]])  # (8,)
+        
+        return video_dict, video_latent, initial_eef, initial_joint
 
 
     def get_traj_info(self, id, start_idx=0, steps=8,skip=1):
@@ -189,20 +255,23 @@ class agent():
         latents = einops.rearrange(latents, 'b f c (m h) (n w) -> (b m n) f c h w', m=3,n=1) # (B, 8, 4, 32,32)
 
 
-        # decode ground truth video
-        true_video = torch.stack(video_latent_true, dim=0) # (bsz, 8,32,32)
-        decoded_video = []
-        bsz,frame_num = true_video.shape[:2]
-        true_video = true_video.flatten(0,1)
-        decode_kwargs = {}
-        for i in range(0,true_video.shape[0],args.decode_chunk_size):
-            chunk = true_video[i:i+args.decode_chunk_size]/pipeline.vae.config.scaling_factor
-            decode_kwargs["num_frames"] = chunk.shape[0]
-            decoded_video.append(pipeline.vae.decode(chunk, **decode_kwargs).sample)
-        true_video = torch.cat(decoded_video,dim=0)
-        true_video = true_video.reshape(bsz,frame_num,*true_video.shape[1:])
-        true_video = ((true_video / 2.0 + 0.5).clamp(0, 1)*255)
-        true_video = true_video.detach().to(torch.float32).cpu().numpy().transpose(0,1,3,4,2).astype(np.uint8) #(2,16,256,256,3)
+        # decode ground truth video (optional - only if provided)
+        if video_latent_true is not None:
+            true_video = torch.stack(video_latent_true, dim=0) # (bsz, 8,32,32)
+            decoded_video = []
+            bsz,frame_num = true_video.shape[:2]
+            true_video = true_video.flatten(0,1)
+            decode_kwargs = {}
+            for i in range(0,true_video.shape[0],args.decode_chunk_size):
+                chunk = true_video[i:i+args.decode_chunk_size]/pipeline.vae.config.scaling_factor
+                decode_kwargs["num_frames"] = chunk.shape[0]
+                decoded_video.append(pipeline.vae.decode(chunk, **decode_kwargs).sample)
+            true_video = torch.cat(decoded_video,dim=0)
+            true_video = true_video.reshape(bsz,frame_num,*true_video.shape[1:])
+            true_video = ((true_video / 2.0 + 0.5).clamp(0, 1)*255)
+            true_video = true_video.detach().to(torch.float32).cpu().numpy().transpose(0,1,3,4,2).astype(np.uint8) #(2,16,256,256,3)
+        else:
+            true_video = None
 
         # decode predicted video
         decoded_video = []
@@ -218,9 +287,13 @@ class agent():
         videos = ((videos / 2.0 + 0.5).clamp(0, 1)*255)
         videos = videos.detach().to(torch.float32).cpu().numpy().transpose(0,1,3,4,2).astype(np.uint8)
 
-        # concatenate true videos and video
-        videos_cat = np.concatenate([true_video,videos],axis=-3) # (3, 8, 256, 256, 3)
-        videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8) 
+        # concatenate true videos and video (if ground truth available)
+        if true_video is not None:
+            videos_cat = np.concatenate([true_video,videos],axis=-3) # (3, 8, 256, 256, 3)
+            videos_cat = np.concatenate([video for video in videos_cat],axis=-2).astype(np.uint8)
+        else:
+            # If no ground truth, just use predicted videos
+            videos_cat = np.concatenate([video for video in videos],axis=-2).astype(np.uint8)
 
         return videos_cat, true_video, videos, latents  # np.uint8:(3, 8, 128, 256, 3) or (3, 8, 192, 320, 3)
 
@@ -301,7 +374,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_meta_info_path', type=str, default=None)
     parser.add_argument('--dataset_names', type=str, default=None)
     parser.add_argument('--task_type', type=str, default=None)
-    parser.add_argument('--pi_ckpt', type=str, default='/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid')
+    parser.add_argument('--pi_ckpt', type=str, default=None)
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -313,6 +386,9 @@ if __name__ == "__main__":
         return cfg
 
     args = merge_args(args, args_new)
+    
+    # Debug: print the pi_ckpt value being used
+    print(f"Using pi_ckpt: {args.pi_ckpt}")
 
     # create agent
     Agent = agent(args)
@@ -325,35 +401,97 @@ if __name__ == "__main__":
     # run len(val_id) trajectory
     for val_id_i, text_i, start_idx_i in zip(args.val_id, args.instruction, args.start_idx):
 
-        # get initial state and groud truth
-        id = val_id_i
-        eef_gt, joint_pos_gt, video_dict, video_latents,_ = Agent.get_traj_info(val_id_i, start_idx=start_idx_i, steps=int(pred_step*interact_num+8))
-        print("text_i:",text_i, "eef pose at t=0", eef_gt[0], "joint at t=0", joint_pos_gt[0])
+        # Check if using image-based initialization
+        use_image_init = hasattr(args, 'init_from_images') and args.init_from_images
+        
+        if use_image_init:
+            # Initialize from images directly
+            scene_dir = os.path.join(args.val_dataset_dir, val_id_i)
+            metadata_path = os.path.join(scene_dir, "metadata.json")
+            
+            if not os.path.exists(metadata_path):
+                raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+            
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+            
+            # Get image paths (assuming standard naming: ext_1.png, ext_2.png, wrist.png)
+            image_paths = [
+                os.path.join(scene_dir, "ext_1.png"),
+                os.path.join(scene_dir, "ext_2.png"), 
+                os.path.join(scene_dir, "wrist.png")
+            ]
+            
+            # Check if images exist, if not try alternative names
+            if not all(os.path.exists(p) for p in image_paths):
+                # Try to find images in the directory
+                import glob
+                png_files = glob.glob(os.path.join(scene_dir, "*.png"))
+                if len(png_files) >= 3:
+                    image_paths = sorted(png_files)[:3]
+                    print(f"Using images: {image_paths}")
+                else:
+                    raise FileNotFoundError(f"Need at least 3 images in {scene_dir}, found {len(png_files)}: {png_files}")
+            
+            joint_pos = np.array(metadata['joint_position'])
+            cartesian_pos = metadata.get('cartesian_position', None)
+            gripper_pos = metadata.get('gripper_position', None)
+            
+            video_dict, video_latents, initial_eef, initial_joint = Agent.init_from_images(
+                image_paths, joint_pos, cartesian_pos, gripper_pos
+            )
+            
+            # Initialize history buffers
+            video_to_save, info_to_save = [], []
+            his_cond, his_joint, his_eef = [], [], []
+            first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
+            assert first_latent.shape == (1, 4, 72, 40), f"Expected first_latent shape (1, 4, 72, 40), got {first_latent.shape}"
+            for i in range(Agent.args.num_history*4):
+                his_cond.append(first_latent)  # (1, 4, 72, 40)
+                his_joint.append(initial_joint[None, :])  # (1, 8)
+                his_eef.append(initial_eef[None, :])  # (1, 7)
+            video_dict_pred = [v[0:1] for v in video_dict]
+            
+            print("text_i:", text_i, "eef pose at t=0", initial_eef, "joint at t=0", initial_joint)
+            print("Initialized from images:", image_paths)
+            
+            # No ground truth for comparison
+            video_latents_gt = None
+            
+        else:
+            # Original dataset-based initialization
+            # get initial state and groud truth
+            id = val_id_i
+            eef_gt, joint_pos_gt, video_dict, video_latents,_ = Agent.get_traj_info(val_id_i, start_idx=start_idx_i, steps=int(pred_step*interact_num+8))
+            print("text_i:",text_i, "eef pose at t=0", eef_gt[0], "joint at t=0", joint_pos_gt[0])
 
-        # initialize all history buffer
-        video_to_save, info_to_save = [], []
-        his_cond, his_joint, his_eef = [], [], []
-        first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
-        assert first_latent.shape == (1, 4, 72, 40), f"Expected first_latent shape (1, 4, 72, 40), got {first_latent.shape}"
-        for i in range(Agent.args.num_history*4):
-            his_cond.append(first_latent)  # (1, 4, 72, 40)
-            his_joint.append(joint_pos_gt[0:1])  # (1, 7)
-            his_eef.append(eef_gt[0:1])  # (1, 7)
-        video_dict_pred = [v[0:1] for v in video_dict]
+            # initialize all history buffer
+            video_to_save, info_to_save = [], []
+            his_cond, his_joint, his_eef = [], [], []
+            first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
+            assert first_latent.shape == (1, 4, 72, 40), f"Expected first_latent shape (1, 4, 72, 40), got {first_latent.shape}"
+            for i in range(Agent.args.num_history*4):
+                his_cond.append(first_latent)  # (1, 4, 72, 40)
+                his_joint.append(joint_pos_gt[0:1])  # (1, 8) - note: should be 8 with gripper
+                his_eef.append(eef_gt[0:1])  # (1, 7)
+            video_dict_pred = [v[0:1] for v in video_dict]
+            video_latents_gt = video_latents
 
 
         # start rollout
         for i in range(interact_num):
-            # get ground truth video latents
-            # video_latent_true = [v[int(i*pred_step):int(i*pred_step+num_frames)] for v in video_latents]
-            start_id = int(i*(pred_step-1))
-            end_id = start_id + pred_step
-            video_latent_true = [v[start_id:end_id] for v in video_latents]
+            # get ground truth video latents (if available)
+            if video_latents_gt is not None:
+                start_id = int(i*(pred_step-1))
+                end_id = start_id + pred_step
+                video_latent_true = [v[start_id:end_id] for v in video_latents_gt]
+            else:
+                video_latent_true = None
             
             print("################ policy forward ####################")
             # prepare input for policy
-            current_joint = his_joint[-1][0] # (1, 8)
-            current_pose = his_eef[-1][0] # (1, 8)
+            current_joint = his_joint[-1][0]  # (8,) - 7 joints + gripper
+            current_pose = his_eef[-1][0]  # (7,) - xyz + euler + gripper
             current_obs = [v[-1] for v in video_dict_pred] 
             # forward policy
             policy_in_out, joint_pos, cartesian_pose= Agent.forward_policy(current_obs, current_pose, current_joint, text=text_i)

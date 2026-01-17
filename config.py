@@ -11,7 +11,7 @@ class wm_args:
     svd_model_path = "/cephfs/shared/llm/stable-video-diffusion-img2vid"
     clip_model_path = "/cephfs/shared/llm/clip-vit-base-patch32"
     ckpt_path = '/cephfs/cjyyj/code/video_evaluation/output2/exp33_210_s11/checkpoint-10000.pt'
-    pi_ckpt = '/cephfs/shared/llm/openpi/openpi-assets-preview/checkpoints/pi05_droid'
+    pi_ckpt = 'gs://openpi-assets/checkpoints/pi05_droid'  # GCS path - will auto-download to ~/.cache/openpi
 
     # dataset parameters
     # raw data
@@ -122,14 +122,12 @@ class wm_args:
         #     self.ineraction_num = 7
 
         elif self.task_type == "pickplace":
-            self.interact_num = 15
-            self.val_dataset_dir = "dataset_example/droid_new_setup"
-            self.val_id = ['0001','0002','0003']
+            self.interact_num = 20
+            self.val_dataset_dir = "dataset_example/my_droid"
+            self.val_id = ['scene_0']
             self.start_idx = [0] * len(self.val_id)
-            self.instruction = [
-                "pick up the green block and place in plate",
-                "pick up the green block and place in plate",
-                "pick up the blue block and place in plate",]
+            self.instruction = ["pick up the green block"]
+            self.init_from_images = True  # Use image-based initialization
 
         elif self.task_type == "towel_fold":
             self.interact_num = 15
