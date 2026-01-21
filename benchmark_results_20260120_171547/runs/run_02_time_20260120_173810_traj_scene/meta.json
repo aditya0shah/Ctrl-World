@@ -1,0 +1,8 @@
+{
+  "run_index": 2,
+  "trajectory_slug": "time_20260120_173810_traj_scene",
+  "video_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table.mp4",
+  "view0_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table_view0.mp4",
+  "view1_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table_view1.mp4",
+  "task": "put plate on table"
+}

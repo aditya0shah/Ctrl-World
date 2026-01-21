@@ -1,0 +1,4 @@
+run_XX: run index (00, 01, ...)
+time_YYYYMMDD_HHMMSS: timestamp from trajectory video stem
+traj_ZZZ: validation id (e.g. scene_1, 0004)
+trajectory_slug = time_YYYYMMDD_HHMMSS_traj_ZZZ — use to find a trajectory from a graph.

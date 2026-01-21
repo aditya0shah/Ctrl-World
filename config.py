@@ -124,9 +124,9 @@ class wm_args:
         elif self.task_type == "pickplace":
             self.interact_num = 20
             self.val_dataset_dir = "dataset_example/my_droid"
-            self.val_id = ['scene_0']
+            self.val_id = ['scene_1']
             self.start_idx = [0] * len(self.val_id)
-            self.instruction = ["pick up the green block"]
+            self.instruction = ["put plate on table"]
             self.init_from_images = True  # Use image-based initialization
 
         elif self.task_type == "towel_fold":

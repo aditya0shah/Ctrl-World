@@ -1,0 +1,71 @@
+[
+  {
+    "run_index": 0,
+    "trajectory_slug": "time_20260120_172316_traj_scene",
+    "run_folder": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene",
+    "task": "put plate on table",
+    "video_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/pickplace_time_20260120_172316_traj_scene_1_0_2_put_plate_on_table.mp4",
+    "view0_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_172316_traj_scene_1_0_2_put_plate_on_table_view0.mp4",
+    "view1_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_172316_traj_scene_1_0_2_put_plate_on_table_view1.mp4",
+    "reward_files": {
+      "view0": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/view0_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/view0_roboreward_rewards.npy"
+      },
+      "view1": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/view1_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/view1_roboreward_rewards.npy"
+      }
+    },
+    "plot_files": {
+      "view0": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/plot_view0_RFM_vs_RoboReward.png",
+      "view1": "benchmark_results_20260120_171547/runs/run_00_time_20260120_172316_traj_scene/plot_view1_RFM_vs_RoboReward.png"
+    }
+  },
+  {
+    "run_index": 1,
+    "trajectory_slug": "time_20260120_173044_traj_scene",
+    "run_folder": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene",
+    "task": "put plate on table",
+    "video_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/pickplace_time_20260120_173044_traj_scene_1_0_2_put_plate_on_table.mp4",
+    "view0_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173044_traj_scene_1_0_2_put_plate_on_table_view0.mp4",
+    "view1_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173044_traj_scene_1_0_2_put_plate_on_table_view1.mp4",
+    "reward_files": {
+      "view0": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/view0_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/view0_roboreward_rewards.npy"
+      },
+      "view1": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/view1_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/view1_roboreward_rewards.npy"
+      }
+    },
+    "plot_files": {
+      "view0": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/plot_view0_RFM_vs_RoboReward.png",
+      "view1": "benchmark_results_20260120_171547/runs/run_01_time_20260120_173044_traj_scene/plot_view1_RFM_vs_RoboReward.png"
+    }
+  },
+  {
+    "run_index": 2,
+    "trajectory_slug": "time_20260120_173810_traj_scene",
+    "run_folder": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene",
+    "task": "put plate on table",
+    "video_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table.mp4",
+    "view0_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table_view0.mp4",
+    "view1_path": "benchmark_results_20260120_171547/rollouts/Rollouts_interact_pi/video/single_views/pickplace_time_20260120_173810_traj_scene_1_0_2_put_plate_on_table_view1.mp4",
+    "reward_files": {
+      "view0": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/view0_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/view0_roboreward_rewards.npy"
+      },
+      "view1": {
+        "rfm": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/view1_rfm_rewards.npy",
+        "roboreward": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/view1_roboreward_rewards.npy"
+      }
+    },
+    "plot_files": {
+      "view0": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/plot_view0_RFM_vs_RoboReward.png",
+      "view1": "benchmark_results_20260120_171547/runs/run_02_time_20260120_173810_traj_scene/plot_view1_RFM_vs_RoboReward.png"
+    }
+  }
+]

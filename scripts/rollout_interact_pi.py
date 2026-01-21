@@ -375,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_names', type=str, default=None)
     parser.add_argument('--task_type', type=str, default=None)
     parser.add_argument('--pi_ckpt', type=str, default=None)
+    parser.add_argument('--save_dir', type=str, default=None)
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
