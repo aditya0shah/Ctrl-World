@@ -122,7 +122,7 @@ class wm_args:
         #     self.ineraction_num = 7
 
         elif self.task_type == "pickplace":
-            self.interact_num = 20
+            self.interact_num = 5
             self.val_dataset_dir = "dataset_example/my_droid"
             self.val_id = ['scene_1']
             self.start_idx = [0] * len(self.val_id)

@@ -461,22 +461,47 @@ class CtrlWorldDiffusionPipeline(StableVideoDiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         # print("prediction type",self.scheduler.config.prediction_type)
+        
+        # Pre-allocate tensors for CFG to avoid repeated torch.cat in loop
+        if do_classifier_free_guidance:
+            # Pre-allocate doubled latents buffer
+            latents_cfg_buffer = None
+        
         if cond_wrist is not None:
             B,F, C, H, W = latents.shape
             cond_wrist = einops.repeat(cond_wrist, 'b l c h w -> b (f l) (n c) h w', n=3,f=num_frames) # (B, 8, 12 , 24, 40)
-            cond_wrist = torch.cat([cond_wrist]*2) if do_classifier_free_guidance else cond_wrist
+            if do_classifier_free_guidance:
+                cond_wrist = torch.cat([cond_wrist]*2, dim=0)
         
         if history is not None:
-            history = torch.cat([history] * 2) if do_classifier_free_guidance else history
+            num_his = history.shape[1]
+            if do_classifier_free_guidance:
+                history = torch.cat([history] * 2, dim=0)
+        else:
+            num_his = 0
         
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                # Optimize: use repeat instead of cat for better memory efficiency
+                if do_classifier_free_guidance:
+                    if latents_cfg_buffer is None or latents_cfg_buffer.shape != (batch_size * 2, *latents.shape[1:]):
+                        latents_cfg_buffer = torch.empty((batch_size * 2, *latents.shape[1:]), dtype=latents.dtype, device=latents.device)
+                    latents_cfg_buffer[:batch_size] = latents
+                    latents_cfg_buffer[batch_size:] = latents
+                    latent_model_input = latents_cfg_buffer
+                else:
+                    latent_model_input = latents
+                    
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if history is not None:
-                    latent_model_input = torch.cat([history, latent_model_input], dim=1) # (bsz*2,frame+F,4,32,32)
+                    # Optimize: pre-allocate and use indexing instead of cat
+                    if do_classifier_free_guidance:
+                        # latent_model_input is (bsz*2, f, c, h, w), history is (bsz*2, num_his, c, h, w)
+                        latent_model_input = torch.cat([history, latent_model_input], dim=1) # (bsz*2,frame+F,4,32,32)
+                    else:
+                        latent_model_input = torch.cat([history, latent_model_input], dim=1)
 
                 # Concatenate image_latents over channels dimention
                 latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)

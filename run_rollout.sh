@@ -24,8 +24,8 @@ python "${SCRIPT_DIR}/scripts/rollout_interact_pi.py" \
   --svd_model_path "${SCRIPT_DIR}/checkpoints/stable-video-diffusion-img2vid" \
   --clip_model_path "${SCRIPT_DIR}/checkpoints/clip-vit-base-patch32" \
   --ckpt_path "${SCRIPT_DIR}/checkpoints/Ctrl-World/checkpoint-10000.pt" \
-  --pi_ckpt gs://openpi-assets/checkpoints/pi05_droid
-
+  --pi_ckpt gs://openpi-assets/checkpoints/pi05_droid \
+  --batch_size 8
 # Note: 
 # - pi_ckpt uses GCS path which will be automatically downloaded to ~/.cache/openpi on first use
 # - Output videos will be saved to: synthetic_traj/Rollouts_interact_pi/video/
