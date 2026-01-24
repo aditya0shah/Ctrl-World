@@ -44,7 +44,7 @@ pip install -r requirements.txt
 
 #  If you want to use ctrl-world to interact with $\pi_{0.5}$ model, following the pi official repo to install the pi model dependencies. Otherwise you can skip it.
 # (from https://github.com/Physical-Intelligence/openpi/tree/main)
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
+git clone --recurse-submodules git@github.com:aditya0shah/openpi.git
 cd openpi
 pip install uv
 GIT_LFS_SKIP_SMUDGE=1 uv sync
