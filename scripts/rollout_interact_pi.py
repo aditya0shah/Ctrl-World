@@ -647,7 +647,8 @@ if __name__ == "__main__":
     parser.add_argument('--task_type', type=str, default=None)
     parser.add_argument('--pi_ckpt', type=str, default=None)
     parser.add_argument('--save_dir', type=str, default=None)
-    parser.add_argument('--batch_size', type=int, default=1, help='Number of parallel trajectories to run from same initial state')
+    parser.add_argument('--batch_size', type=int, default=1, help='Number of parallel trajectories to run from same initial state per batch')
+    parser.add_argument('--num_trajectories', type=int, default=None, help='Total number of trajectories to run. If None, uses batch_size. If > batch_size, runs sequential batches.')
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -670,7 +671,17 @@ if __name__ == "__main__":
     num_history = args.num_history
     num_frames = args.num_frames
     history_idx = args.history_idx
-    batch_size = args.batch_size  # Number of parallel trajectories
+    batch_size = args.batch_size  # Number of parallel trajectories per batch
+    
+    # Determine total number of trajectories and number of batches
+    if args.num_trajectories is not None:
+        num_trajectories = args.num_trajectories
+        num_batches = (num_trajectories + batch_size - 1) // batch_size  # Ceiling division
+        print(f"Running {num_trajectories} total trajectories in {num_batches} sequential batches of {batch_size}")
+    else:
+        num_trajectories = batch_size
+        num_batches = 1
+        print(f"Running {batch_size} trajectories in 1 batch")
 
     # run len(val_id) trajectory
     for val_id_i, text_i, start_idx_i in zip(args.val_id, args.instruction, args.start_idx):
@@ -769,166 +780,211 @@ if __name__ == "__main__":
             video_latents_gt = video_latents
             print(f"Running {batch_size} parallel trajectories from same initial state")
 
+        # Run sequential batches if num_trajectories > batch_size
+        for batch_iter in range(num_batches):
+            # Calculate trajectories for this batch
+            batch_start_idx = batch_iter * batch_size
+            batch_end_idx = min(batch_start_idx + batch_size, num_trajectories)
+            current_batch_size = batch_end_idx - batch_start_idx
+            
+            if num_batches > 1:
+                print(f"\n{'='*80}")
+                print(f"Running batch {batch_iter + 1}/{num_batches} (trajectories {batch_start_idx} to {batch_end_idx - 1})")
+                print(f"{'='*80}\n")
+            
+            # Initialize history buffers for current batch
+            if use_image_init:
+                video_to_save_batch = [[] for _ in range(current_batch_size)]
+                info_to_save_batch = [[] for _ in range(current_batch_size)]
+                his_cond_batch = [[] for _ in range(current_batch_size)]
+                his_joint_batch = [[] for _ in range(current_batch_size)]
+                his_eef_batch = [[] for _ in range(current_batch_size)]
+                first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
+                initial_joint_single = torch.from_numpy(initial_joint[None, :]).to(Agent.device).to(Agent.dtype)  # (1, 8)
+                initial_eef_single = torch.from_numpy(initial_eef[None, :]).to(Agent.device).to(Agent.dtype)  # (1, 7)
+                for traj_idx in range(current_batch_size):
+                    for i in range(Agent.args.num_history*4):
+                        his_cond_batch[traj_idx].append(first_latent.clone())
+                        his_joint_batch[traj_idx].append(initial_joint_single.clone())
+                        his_eef_batch[traj_idx].append(initial_eef_single.clone())
+                video_dict_pred_batch = [[v[0:1] for v in video_dict] for _ in range(current_batch_size)]
+            else:
+                video_to_save_batch = [[] for _ in range(current_batch_size)]
+                info_to_save_batch = [[] for _ in range(current_batch_size)]
+                his_cond_batch = [[] for _ in range(current_batch_size)]
+                his_joint_batch = [[] for _ in range(current_batch_size)]
+                his_eef_batch = [[] for _ in range(current_batch_size)]
+                first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
+                initial_joint_single = torch.from_numpy(joint_pos_gt[0:1]).to(Agent.device).to(Agent.dtype)  # (1, 8)
+                initial_eef_single = torch.from_numpy(eef_gt[0:1]).to(Agent.device).to(Agent.dtype)  # (1, 7)
+                for traj_idx in range(current_batch_size):
+                    for i in range(Agent.args.num_history*4):
+                        his_cond_batch[traj_idx].append(first_latent.clone())
+                        his_joint_batch[traj_idx].append(initial_joint_single.clone())
+                        his_eef_batch[traj_idx].append(initial_eef_single.clone())
+                video_dict_pred_batch = [[v[0:1] for v in video_dict] for _ in range(current_batch_size)]
 
-        # start rollout - batched version
-        for i in range(interact_num):
-            print(f"################ Step {i+1}/{interact_num} - Batched Rollout (batch_size={batch_size}) ################")
-            
-            # Collect inputs from all trajectories for batched policy and world model forward pass
-            # Prepare batched inputs for policy
-            videos_batch = []
-            states_batch = []
-            joints_batch = []
-            
-            for traj_idx in range(batch_size):
-                # Get current state for this trajectory
-                current_joint = his_joint_batch[traj_idx][-1][0]  # (8,)
-                current_pose = his_eef_batch[traj_idx][-1][0]  # (7,)
-                # Convert tensors to numpy arrays if needed (forward_policy_batch expects numpy arrays)
-                if isinstance(current_joint, torch.Tensor):
-                    current_joint = current_joint.cpu().float().numpy()
-                if isinstance(current_pose, torch.Tensor):
-                    current_pose = current_pose.cpu().float().numpy()
-                # Extract last frame from each video view
-                # Handle both (1, H, W, 3) and (num_frames, h, w, c) shapes
-                current_obs = []
-                for v in video_dict_pred_batch[traj_idx]:
-                    if len(v.shape) == 4:
-                        # Shape is (num_frames, h, w, c) or (1, H, W, 3)
-                        # Use v[0] if first dim is 1, otherwise v[-1]
-                        current_obs.append(v[0] if v.shape[0] == 1 else v[-1])
+            # start rollout - batched version
+            for i in range(interact_num):
+                print(f"################ Step {i+1}/{interact_num} - Batched Rollout (batch_size={current_batch_size}) ################")
+                
+                # Collect inputs from all trajectories for batched policy and world model forward pass
+                # Prepare batched inputs for policy
+                videos_batch = []
+                states_batch = []
+                joints_batch = []
+                
+                for traj_idx in range(current_batch_size):
+                    # Get current state for this trajectory
+                    current_joint = his_joint_batch[traj_idx][-1][0]  # (8,)
+                    current_pose = his_eef_batch[traj_idx][-1][0]  # (7,)
+                    # Convert tensors to numpy arrays if needed (forward_policy_batch expects numpy arrays)
+                    if isinstance(current_joint, torch.Tensor):
+                        current_joint = current_joint.cpu().float().numpy()
+                    if isinstance(current_pose, torch.Tensor):
+                        current_pose = current_pose.cpu().float().numpy()
+                    # Extract last frame from each video view
+                    # Handle both (1, H, W, 3) and (num_frames, h, w, c) shapes
+                    current_obs = []
+                    for v in video_dict_pred_batch[traj_idx]:
+                        if len(v.shape) == 4:
+                            # Shape is (num_frames, h, w, c) or (1, H, W, 3)
+                            # Use v[0] if first dim is 1, otherwise v[-1]
+                            current_obs.append(v[0] if v.shape[0] == 1 else v[-1])
+                        else:
+                            # Already 3D: (h, w, c)
+                            current_obs.append(v)
+                    
+                    videos_batch.append(current_obs)
+                    states_batch.append(current_pose)
+                    joints_batch.append(current_joint)
+                
+                # BATCHED policy forward pass - processes all trajectories at once
+                print(f"################ Batched policy forward (batch_size={current_batch_size}) ################")
+                policy_outputs, joint_positions, cartesian_poses = Agent.forward_policy_batch(
+                    videos_batch, states_batch, joints_batch, text_i
+                )
+                
+                # Prepare world model inputs for each trajectory (after policy divergence)
+                action_conds = []
+                current_latents = []
+                his_latents = []
+                history_idx = args.history_idx
+                
+                for traj_idx in range(current_batch_size):
+                    # Convert tensors to numpy arrays if needed for numpy operations
+                    his_pose_elems = []
+                    for idx in history_idx:
+                        elem = his_eef_batch[traj_idx][idx][0]  # (7,)
+                        if isinstance(elem, torch.Tensor):
+                            elem = elem.cpu().float().numpy()
+                        # Ensure element is 2D: (1, 7)
+                        if elem.ndim == 1:
+                            elem = elem[None, :]  # (1, 7)
+                        his_pose_elems.append(elem)
+                    his_pose = np.concatenate(his_pose_elems, axis=0)  # (num_history, 7)
+                    action_cond = np.concatenate([his_pose, cartesian_poses[traj_idx]], axis=0)  # (num_history+num_frames, 7)
+                    his_latent = torch.cat([his_cond_batch[traj_idx][idx] for idx in history_idx], dim=0).unsqueeze(0)  # (1, num_history, 4, 72, 40)
+                    current_latent = his_cond_batch[traj_idx][-1]  # (1, 4, 72, 40)
+                    
+                    action_conds.append(action_cond)
+                    current_latents.append(current_latent)
+                    his_latents.append(his_latent)
+                
+                # Stack into batches for world model
+                action_cond_batch = np.stack(action_conds, axis=0)  # (current_batch_size, num_history+num_frames, 7)
+                current_latent_batch = torch.cat(current_latents, dim=0)  # (current_batch_size, 4, 72, 40)
+                his_latent_batch = torch.cat(his_latents, dim=0)  # (current_batch_size, num_history, 4, 72, 40)
+                text_batch = [text_i if Agent.args.text_cond else None] * current_batch_size
+                
+                print(f"################ Batched world model forward (batch_size={current_batch_size}) ################")
+                # BATCHED world model forward pass - this is where we get speedup!
+                videos_cat_batch, true_videos, video_dict_pred_batch_output, predict_latents = Agent.forward_wm(
+                    action_cond_batch,
+                    None,  # No ground truth for batched rollouts
+                    current_latent_batch,
+                    his_cond=his_latent_batch,
+                    text=text_batch
+                )
+                
+                print("################ Update history buffers for each trajectory ################")
+                # Split outputs and update history buffers for each trajectory
+                for traj_idx in range(current_batch_size):
+                    # Extract this trajectory's latents
+                    # predict_latents is a list of 3 tensors (one per camera view)
+                    # For current_batch_size > 1, each tensor has shape (current_batch_size, num_frames, 4, 24, 40)
+                    # For current_batch_size = 1, each tensor has shape (num_frames, 4, 24, 40)
+                    if current_batch_size == 1:
+                        traj_latents = predict_latents  # Already single sample format
                     else:
-                        # Already 3D: (h, w, c)
-                        current_obs.append(v)
+                        traj_latents = [v[traj_idx:traj_idx+1] for v in predict_latents]  # Each: (1, num_frames, 4, 24, 40)
+                    
+                    # Update history buffers for this trajectory
+                    # joint_positions[traj_idx] has shape (pred_step, 8), extract the last step
+                    joint_update = joint_positions[traj_idx][pred_step-1:pred_step]  # (1, 8)
+                    his_joint_batch[traj_idx].append(joint_update)  # Append to this trajectory's history
+                    
+                    cartesian_update = cartesian_poses[traj_idx][pred_step-1:pred_step]  # (1, 7)
+                    his_eef_batch[traj_idx].append(cartesian_update)  # Append to this trajectory's history
+                    
+                    # Combine latents from all camera views for this trajectory
+                    if current_batch_size == 1:
+                        # traj_latents is list of (num_frames, 4, 24, 40)
+                        combined_latent = torch.cat([v[pred_step-1:pred_step] for v in traj_latents], dim=2)  # (1, 4, 72, 40)
+                    else:
+                        # traj_latents is list of (1, num_frames, 4, 24, 40)
+                        combined_latent = torch.cat([v[0, pred_step-1:pred_step] for v in traj_latents], dim=2)  # (1, 4, 72, 40)
+                    
+                    his_cond_batch[traj_idx].append(combined_latent)  # Append to this trajectory's history
+                    
+                    # Update video predictions for this trajectory
+                    # video_dict_pred_batch_output is a list of arrays (one per camera view)
+                    # Each array has shape (current_batch_size, num_frames, h, w, c) for batched or (num_frames, h, w, c) for single
+                    if current_batch_size == 1:
+                        video_dict_pred_batch[traj_idx] = video_dict_pred_batch_output
+                        # videos_cat_batch is already in single trajectory format
+                        video_to_save_batch[traj_idx].append(videos_cat_batch[:pred_step-1])
+                    else:
+                        # Extract this trajectory's video predictions from batched output
+                        # video_dict_pred_batch_output is list of (current_batch_size, num_frames, h, w, c) arrays
+                        video_dict_pred_batch[traj_idx] = [v[traj_idx] for v in video_dict_pred_batch_output]  # Each: (num_frames, h, w, c)
+                        # Extract this trajectory's videos from each view and concatenate
+                        traj_videos_per_view = [v[traj_idx, :pred_step-1] for v in video_dict_pred_batch_output]  # Each: (pred_step-1, h, w, c)
+                        # Concatenate views horizontally for this trajectory (same as original format)
+                        traj_video_cat = np.concatenate(traj_videos_per_view, axis=-2)  # (pred_step-1, h, 3*w, c)
+                        video_to_save_batch[traj_idx].append(traj_video_cat)
+                    
+                    info_to_save_batch[traj_idx].append(policy_outputs[traj_idx])
+            
+            # save rollout videos and info for each trajectory in current batch
+            print("##########################################################################")
+            uuid = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            text_id = text_i.replace(' ', '_').replace(',', '').replace('.', '').replace('\'', '').replace('\"', '')[:40]
+            
+            for traj_idx in range(current_batch_size):
+                # Calculate global trajectory index across all batches
+                global_traj_idx = batch_start_idx + traj_idx
                 
-                videos_batch.append(current_obs)
-                states_batch.append(current_pose)
-                joints_batch.append(current_joint)
-            
-            # BATCHED policy forward pass - processes all trajectories at once
-            print(f"################ Batched policy forward (batch_size={batch_size}) ################")
-            policy_outputs, joint_positions, cartesian_poses = Agent.forward_policy_batch(
-                videos_batch, states_batch, joints_batch, text_i
-            )
-            
-            # Prepare world model inputs for each trajectory (after policy divergence)
-            action_conds = []
-            current_latents = []
-            his_latents = []
-            history_idx = args.history_idx
-            
-            for traj_idx in range(batch_size):
-                # Convert tensors to numpy arrays if needed for numpy operations
-                his_pose_elems = []
-                for idx in history_idx:
-                    elem = his_eef_batch[traj_idx][idx][0]  # (7,)
-                    if isinstance(elem, torch.Tensor):
-                        elem = elem.cpu().float().numpy()
-                    # Ensure element is 2D: (1, 7)
-                    if elem.ndim == 1:
-                        elem = elem[None, :]  # (1, 7)
-                    his_pose_elems.append(elem)
-                his_pose = np.concatenate(his_pose_elems, axis=0)  # (num_history, 7)
-                action_cond = np.concatenate([his_pose, cartesian_poses[traj_idx]], axis=0)  # (num_history+num_frames, 7)
-                his_latent = torch.cat([his_cond_batch[traj_idx][idx] for idx in history_idx], dim=0).unsqueeze(0)  # (1, num_history, 4, 72, 40)
-                current_latent = his_cond_batch[traj_idx][-1]  # (1, 4, 72, 40)
+                video = np.concatenate(video_to_save_batch[traj_idx], axis=0)
+                filename_video = f"{args.save_dir}/{args.task_name}/video/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{args.policy_skip_step}_{text_id}_batch{global_traj_idx}.mp4"
+                os.makedirs(os.path.dirname(filename_video), exist_ok=True)
+                mediapy.write_video(filename_video, video, fps=4)
+                print(f"Saving video for trajectory {global_traj_idx} (batch {batch_iter+1}/{num_batches}, local idx {traj_idx}) to {filename_video}")
                 
-                action_conds.append(action_cond)
-                current_latents.append(current_latent)
-                his_latents.append(his_latent)
-            
-            # Stack into batches for world model
-            action_cond_batch = np.stack(action_conds, axis=0)  # (batch_size, num_history+num_frames, 7)
-            current_latent_batch = torch.cat(current_latents, dim=0)  # (batch_size, 4, 72, 40)
-            his_latent_batch = torch.cat(his_latents, dim=0)  # (batch_size, num_history, 4, 72, 40)
-            text_batch = [text_i if Agent.args.text_cond else None] * batch_size
-            
-            print(f"################ Batched world model forward (batch_size={batch_size}) ################")
-            # BATCHED world model forward pass - this is where we get speedup!
-            videos_cat_batch, true_videos, video_dict_pred_batch_output, predict_latents = Agent.forward_wm(
-                action_cond_batch,
-                None,  # No ground truth for batched rollouts
-                current_latent_batch,
-                his_cond=his_latent_batch,
-                text=text_batch
-            )
-            
-            print("################ Update history buffers for each trajectory ################")
-            # Split outputs and update history buffers for each trajectory
-            for traj_idx in range(batch_size):
-                # Extract this trajectory's latents
-                # predict_latents is a list of 3 tensors (one per camera view)
-                # For batch_size > 1, each tensor has shape (batch_size, num_frames, 4, 24, 40)
-                # For batch_size = 1, each tensor has shape (num_frames, 4, 24, 40)
-                if batch_size == 1:
-                    traj_latents = predict_latents  # Already single sample format
-                else:
-                    traj_latents = [v[traj_idx:traj_idx+1] for v in predict_latents]  # Each: (1, num_frames, 4, 24, 40)
+                info = {'success': 1, 'start_idx': 0, 'end_idx': video.shape[0]-1, 'instructions': text_i, 'batch_idx': global_traj_idx, 'batch_iter': batch_iter, 'local_idx': traj_idx}
+                if len(info_to_save_batch[traj_idx]) > 0:
+                    for key in info_to_save_batch[traj_idx][0].keys():
+                        info[key] = []
+                        for i in range(len(info_to_save_batch[traj_idx])):
+                            info[key] += info_to_save_batch[traj_idx][i][key].tolist()
                 
-                # Update history buffers for this trajectory
-                # joint_positions[traj_idx] has shape (pred_step, 8), extract the last step
-                joint_update = joint_positions[traj_idx][pred_step-1:pred_step]  # (1, 8)
-                his_joint_batch[traj_idx].append(joint_update)  # Append to this trajectory's history
-                
-                cartesian_update = cartesian_poses[traj_idx][pred_step-1:pred_step]  # (1, 7)
-                his_eef_batch[traj_idx].append(cartesian_update)  # Append to this trajectory's history
-                
-                # Combine latents from all camera views for this trajectory
-                if batch_size == 1:
-                    # traj_latents is list of (num_frames, 4, 24, 40)
-                    combined_latent = torch.cat([v[pred_step-1:pred_step] for v in traj_latents], dim=2)  # (1, 4, 72, 40)
-                else:
-                    # traj_latents is list of (1, num_frames, 4, 24, 40)
-                    combined_latent = torch.cat([v[0, pred_step-1:pred_step] for v in traj_latents], dim=2)  # (1, 4, 72, 40)
-                
-                his_cond_batch[traj_idx].append(combined_latent)  # Append to this trajectory's history
-                
-                # Update video predictions for this trajectory
-                # video_dict_pred_batch_output is a list of arrays (one per camera view)
-                # Each array has shape (batch_size, num_frames, h, w, c) for batched or (num_frames, h, w, c) for single
-                if batch_size == 1:
-                    video_dict_pred_batch[traj_idx] = video_dict_pred_batch_output
-                    # videos_cat_batch is already in single trajectory format
-                    video_to_save_batch[traj_idx].append(videos_cat_batch[:pred_step-1])
-                else:
-                    # Extract this trajectory's video predictions from batched output
-                    # video_dict_pred_batch_output is list of (batch_size, num_frames, h, w, c) arrays
-                    video_dict_pred_batch[traj_idx] = [v[traj_idx] for v in video_dict_pred_batch_output]  # Each: (num_frames, h, w, c)
-                    # Extract this trajectory's videos from each view and concatenate
-                    traj_videos_per_view = [v[traj_idx, :pred_step-1] for v in video_dict_pred_batch_output]  # Each: (pred_step-1, h, w, c)
-                    # Concatenate views horizontally for this trajectory (same as original format)
-                    traj_video_cat = np.concatenate(traj_videos_per_view, axis=-2)  # (pred_step-1, h, 3*w, c)
-                    video_to_save_batch[traj_idx].append(traj_video_cat)
-                
-                info_to_save_batch[traj_idx].append(policy_outputs[traj_idx])
-            
-
-        # save rollout videos and info for each trajectory in batch
-        print("##########################################################################")
-        uuid = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        text_id = text_i.replace(' ', '_').replace(',', '').replace('.', '').replace('\'', '').replace('\"', '')[:40]
-        
-        for traj_idx in range(batch_size):
-            video = np.concatenate(video_to_save_batch[traj_idx], axis=0)
-            filename_video = f"{args.save_dir}/{args.task_name}/video/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{args.policy_skip_step}_{text_id}_batch{traj_idx}.mp4"
-            os.makedirs(os.path.dirname(filename_video), exist_ok=True)
-            mediapy.write_video(filename_video, video, fps=4)
-            print(f"Saving video for trajectory {traj_idx} to {filename_video}")
-            
-            info = {'success': 1, 'start_idx': 0, 'end_idx': video.shape[0]-1, 'instructions': text_i, 'batch_idx': traj_idx}
-            if len(info_to_save_batch[traj_idx]) > 0:
-                for key in info_to_save_batch[traj_idx][0].keys():
-                    info[key] = []
-                    for i in range(len(info_to_save_batch[traj_idx])):
-                        info[key] += info_to_save_batch[traj_idx][i][key].tolist()
-            
-            # save to json
-            filename_info = f"{args.save_dir}/{args.task_name}/info/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{pred_step}_{text_id}_batch{traj_idx}.json"
-            os.makedirs(os.path.dirname(filename_info), exist_ok=True)
-            with open(filename_info, 'w') as f:
-                json.dump(info, f, indent=4)
-            print(f"Saving trajectory info for trajectory {traj_idx} to {filename_info}")
-        print("##########################################################################")
+                # save to json
+                filename_info = f"{args.save_dir}/{args.task_name}/info/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{pred_step}_{text_id}_batch{global_traj_idx}.json"
+                os.makedirs(os.path.dirname(filename_info), exist_ok=True)
+                with open(filename_info, 'w') as f:
+                    json.dump(info, f, indent=4)
+                print(f"Saving trajectory info for trajectory {global_traj_idx} to {filename_info}")
+            print("##########################################################################")
 
 
 # CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 python rollout_interact_pi.py --task_type pickplace

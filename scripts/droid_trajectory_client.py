@@ -9,6 +9,7 @@ evaluates each with RFM rewards, selects the best one, and sends it to the serve
 from __future__ import annotations
 
 import argparse
+import datetime
 import pickle
 import socket
 import struct
@@ -19,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import mediapy
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -191,9 +193,11 @@ def generate_trajectories(
     task: str,
     num_trajectories: int,
     trajectory_length: int = 1,
+    max_batch_size: int = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate N trajectories in parallel from scene data.
+    Supports sequential batches if num_trajectories > max_batch_size.
     
     Args:
         agent_obj: Initialized agent object
@@ -201,6 +205,8 @@ def generate_trajectories(
         task: Task description string
         num_trajectories: Number of trajectories to generate
         trajectory_length: Number of interaction steps per trajectory (default: 1)
+        max_batch_size: Maximum batch size per forward pass. If None, uses num_trajectories (single batch).
+                       If num_trajectories > max_batch_size, runs sequential batches.
     
     Returns:
         List of trajectory dicts, each containing:
@@ -257,177 +263,204 @@ def generate_trajectories(
             gripper_position,
         )
     
-    # Initialize history buffers for each trajectory
-    batch_size = num_trajectories
-    his_cond_batch = [[] for _ in range(batch_size)]
-    his_joint_batch = [[] for _ in range(batch_size)]
-    his_eef_batch = [[] for _ in range(batch_size)]
+    # Determine batch size and number of sequential batches
+    if max_batch_size is None:
+        max_batch_size = num_trajectories
+    num_batches = (num_trajectories + max_batch_size - 1) // max_batch_size  # Ceiling division
     
+    if num_batches > 1:
+        print(f"Generating {num_trajectories} trajectories in {num_batches} sequential batches (max_batch_size={max_batch_size})")
+    else:
+        print(f"Generating {num_trajectories} trajectories in 1 batch")
+    
+    # Store initial state for reuse across batches
     first_latent = torch.cat([v[0] for v in video_latents], dim=1).unsqueeze(0)  # (1, 4, 72, 40)
     initial_joint_single = torch.from_numpy(initial_joint[None, :]).to(agent_obj.device).to(agent_obj.dtype)  # (1, 8)
     initial_eef_single = torch.from_numpy(initial_eef[None, :]).to(agent_obj.device).to(agent_obj.dtype)  # (1, 7)
     
-    for traj_idx in range(batch_size):
-        for i in range(agent_obj.args.num_history * 4):
-            his_cond_batch[traj_idx].append(first_latent.clone())
-            his_joint_batch[traj_idx].append(initial_joint_single.clone())
-            his_eef_batch[traj_idx].append(initial_eef_single.clone())
+    # Collect all trajectories across batches
+    all_trajectories = []
     
-    video_dict_pred_batch = [[v[0:1] for v in video_dict] for _ in range(batch_size)]
-    
-    # Generate trajectories
-    trajectories = []
-    interact_num = trajectory_length
-    
-    for step in range(interact_num):
-        # Collect inputs from all trajectories for batched policy and world model forward pass
-        # Prepare batched inputs for policy
-        videos_batch = []
-        states_batch = []
-        joints_batch = []
+    # Run sequential batches
+    for batch_iter in range(num_batches):
+        batch_start_idx = batch_iter * max_batch_size
+        batch_end_idx = min(batch_start_idx + max_batch_size, num_trajectories)
+        current_batch_size = batch_end_idx - batch_start_idx
         
-        for traj_idx in range(batch_size):
-            # Get current state for this trajectory
-            current_joint = his_joint_batch[traj_idx][-1][0]  # (8,)
-            current_pose = his_eef_batch[traj_idx][-1][0]  # (7,)
-            # Convert tensors to numpy arrays if needed (forward_policy_batch expects numpy arrays)
-            if isinstance(current_joint, torch.Tensor):
-                current_joint = current_joint.cpu().float().numpy()
-            if isinstance(current_pose, torch.Tensor):
-                current_pose = current_pose.cpu().float().numpy()
-            # Extract last frame from each video view
-            # Handle both (1, H, W, 3) and (num_frames, h, w, c) shapes
-            current_obs = []
-            for v in video_dict_pred_batch[traj_idx]:
-                if len(v.shape) == 4:
-                    # Shape is (num_frames, h, w, c) or (1, H, W, 3)
-                    # Use v[0] if first dim is 1, otherwise v[-1]
-                    current_obs.append(v[0] if v.shape[0] == 1 else v[-1])
+        if num_batches > 1:
+            print(f"\n{'='*80}")
+            print(f"Running batch {batch_iter + 1}/{num_batches} (trajectories {batch_start_idx} to {batch_end_idx - 1})")
+            print(f"{'='*80}\n")
+        
+        # Initialize history buffers for current batch
+        his_cond_batch = [[] for _ in range(current_batch_size)]
+        his_joint_batch = [[] for _ in range(current_batch_size)]
+        his_eef_batch = [[] for _ in range(current_batch_size)]
+        
+        for traj_idx in range(current_batch_size):
+            for i in range(agent_obj.args.num_history * 4):
+                his_cond_batch[traj_idx].append(first_latent.clone())
+                his_joint_batch[traj_idx].append(initial_joint_single.clone())
+                his_eef_batch[traj_idx].append(initial_eef_single.clone())
+        
+        video_dict_pred_batch = [[v[0:1] for v in video_dict] for _ in range(current_batch_size)]
+        
+        # Generate trajectories for this batch
+        trajectories = []
+        interact_num = trajectory_length
+        
+        for step in range(interact_num):
+            # Collect inputs from all trajectories for batched policy and world model forward pass
+            # Prepare batched inputs for policy
+            videos_batch = []
+            states_batch = []
+            joints_batch = []
+            
+            for traj_idx in range(current_batch_size):
+                # Get current state for this trajectory
+                current_joint = his_joint_batch[traj_idx][-1][0]  # (8,)
+                current_pose = his_eef_batch[traj_idx][-1][0]  # (7,)
+                # Convert tensors to numpy arrays if needed (forward_policy_batch expects numpy arrays)
+                if isinstance(current_joint, torch.Tensor):
+                    current_joint = current_joint.cpu().float().numpy()
+                if isinstance(current_pose, torch.Tensor):
+                    current_pose = current_pose.cpu().float().numpy()
+                # Extract last frame from each video view
+                # Handle both (1, H, W, 3) and (num_frames, h, w, c) shapes
+                current_obs = []
+                for v in video_dict_pred_batch[traj_idx]:
+                    if len(v.shape) == 4:
+                        # Shape is (num_frames, h, w, c) or (1, H, W, 3)
+                        # Use v[0] if first dim is 1, otherwise v[-1]
+                        current_obs.append(v[0] if v.shape[0] == 1 else v[-1])
+                    else:
+                        # Already 3D: (h, w, c)
+                        current_obs.append(v)
+                
+                videos_batch.append(current_obs)
+                states_batch.append(current_pose)
+                joints_batch.append(current_joint)
+            
+            # BATCHED policy forward pass - processes all trajectories at once
+            policy_outputs, joint_positions, cartesian_poses = agent_obj.forward_policy_batch(
+                videos_batch, states_batch, joints_batch, task
+            )
+            
+            # Prepare world model inputs for each trajectory (after policy divergence)
+            action_conds = []
+            current_latents = []
+            his_latents = []
+            history_idx = agent_obj.args.history_idx
+            
+            for traj_idx in range(current_batch_size):
+                # Convert tensors to numpy arrays if needed for numpy operations
+                his_pose_elems = []
+                for idx in history_idx:
+                    elem = his_eef_batch[traj_idx][idx][0]  # (7,)
+                    if isinstance(elem, torch.Tensor):
+                        elem = elem.cpu().float().numpy()
+                    # Ensure element is 2D: (1, 7)
+                    if elem.ndim == 1:
+                        elem = elem[None, :]  # (1, 7)
+                    his_pose_elems.append(elem)
+                his_pose = np.concatenate(his_pose_elems, axis=0)  # (num_history, 7)
+                action_cond = np.concatenate([his_pose, cartesian_poses[traj_idx]], axis=0)  # (num_history+num_frames, 7)
+                his_latent = torch.cat([his_cond_batch[traj_idx][idx] for idx in history_idx], dim=0).unsqueeze(0)  # (1, num_history, 4, 72, 40)
+                current_latent = his_cond_batch[traj_idx][-1]  # (1, 4, 72, 40)
+                
+                action_conds.append(action_cond)
+                current_latents.append(current_latent)
+                his_latents.append(his_latent)
+            
+            # Batched world model forward pass
+            action_cond_batch = np.stack(action_conds, axis=0)
+            current_latent_batch = torch.cat(current_latents, dim=0)
+            his_latent_batch = torch.cat(his_latents, dim=0)
+            text_batch = [task if agent_obj.args.text_cond else None] * current_batch_size
+            
+            videos_cat_batch, true_videos, video_dict_pred_batch_output, predict_latents = agent_obj.forward_wm(
+                action_cond_batch,
+                None,
+                current_latent_batch,
+                his_cond=his_latent_batch,
+                text=text_batch,
+            )
+            
+            # Update history buffers and collect trajectories
+            for traj_idx in range(current_batch_size):
+                # Extract latents for this trajectory
+                if current_batch_size == 1:
+                    traj_latents = predict_latents
                 else:
-                    # Already 3D: (h, w, c)
-                    current_obs.append(v)
-            
-            videos_batch.append(current_obs)
-            states_batch.append(current_pose)
-            joints_batch.append(current_joint)
+                    traj_latents = [v[traj_idx:traj_idx+1] for v in predict_latents]
+                
+                # Update history
+                joint_update = joint_positions[traj_idx][agent_obj.args.pred_step-1:agent_obj.args.pred_step]
+                his_joint_batch[traj_idx].append(joint_update)
+                
+                cartesian_update = cartesian_poses[traj_idx][agent_obj.args.pred_step-1:agent_obj.args.pred_step]
+                his_eef_batch[traj_idx].append(cartesian_update)
+                
+                # Combine latents
+                if current_batch_size == 1:
+                    combined_latent = torch.cat([v[agent_obj.args.pred_step-1:agent_obj.args.pred_step] for v in traj_latents], dim=2)
+                else:
+                    combined_latent = torch.cat([v[0, agent_obj.args.pred_step-1:agent_obj.args.pred_step] for v in traj_latents], dim=2)
+                his_cond_batch[traj_idx].append(combined_latent)
+                
+                # Update video predictions
+                if current_batch_size == 1:
+                    video_dict_pred_batch[traj_idx] = video_dict_pred_batch_output
+                else:
+                    video_dict_pred_batch[traj_idx] = [v[traj_idx] for v in video_dict_pred_batch_output]
+                
+                # Store trajectory data (only on first step, or accumulate)
+                # Extract predicted video frames for this step
+                # video_dict_pred_batch_output is a list of 3 arrays (one per camera view)
+                # Each array: (current_batch_size, num_frames, H, W, 3) or (num_frames, H, W, 3) for current_batch_size=1
+                if current_batch_size == 1:
+                    # Single batch: each view is (num_frames, H, W, 3)
+                    video_view0_step = video_dict_pred_batch_output[0][:agent_obj.args.pred_step-1]  # (pred_step-1, H, W, 3)
+                else:
+                    # Batched: each view is (current_batch_size, num_frames, H, W, 3)
+                    video_view0_step = video_dict_pred_batch_output[0][traj_idx, :agent_obj.args.pred_step-1]  # (pred_step-1, H, W, 3)
+                
+                if step == 0:
+                    trajectories.append({
+                        "joint_vel": policy_outputs[traj_idx]["joint_vel"].copy(),  # (T, 7)
+                        "predicted_video": [video_view0_step],  # List of (T, H, W, 3) arrays
+                        "joint_pos": policy_outputs[traj_idx]["joint_pos"].copy(),  # (T, 7)
+                        "state_fk": policy_outputs[traj_idx]["state_fk"].copy(),  # (T, 7)
+                    })
+                else:
+                    # Accumulate trajectory data
+                    trajectories[traj_idx]["joint_vel"] = np.concatenate([
+                        trajectories[traj_idx]["joint_vel"],
+                        policy_outputs[traj_idx]["joint_vel"]
+                    ], axis=0)
+                    trajectories[traj_idx]["joint_pos"] = np.concatenate([
+                        trajectories[traj_idx]["joint_pos"],
+                        policy_outputs[traj_idx]["joint_pos"]
+                    ], axis=0)
+                    trajectories[traj_idx]["state_fk"] = np.concatenate([
+                        trajectories[traj_idx]["state_fk"],
+                        policy_outputs[traj_idx]["state_fk"]
+                    ], axis=0)
+                    # Accumulate video frames
+                    trajectories[traj_idx]["predicted_video"].append(video_view0_step)
         
-        # BATCHED policy forward pass - processes all trajectories at once
-        policy_outputs, joint_positions, cartesian_poses = agent_obj.forward_policy_batch(
-            videos_batch, states_batch, joints_batch, task
-        )
+        # Concatenate all video frames for RFM evaluation
+        # Use view0 (ext_1) for RFM evaluation as per run_rollout_reward_comparison.py
+        for traj_idx in range(current_batch_size):
+            # Concatenate all accumulated video frames
+            video_frames_list = trajectories[traj_idx]["predicted_video"]
+            video_view0_full = np.concatenate(video_frames_list, axis=0)  # (total_frames, H, W, 3)
+            trajectories[traj_idx]["predicted_video"] = video_view0_full
         
-        # Prepare world model inputs for each trajectory (after policy divergence)
-        action_conds = []
-        current_latents = []
-        his_latents = []
-        history_idx = agent_obj.args.history_idx
-        
-        for traj_idx in range(batch_size):
-            # Convert tensors to numpy arrays if needed for numpy operations
-            his_pose_elems = []
-            for idx in history_idx:
-                elem = his_eef_batch[traj_idx][idx][0]  # (7,)
-                if isinstance(elem, torch.Tensor):
-                    elem = elem.cpu().float().numpy()
-                # Ensure element is 2D: (1, 7)
-                if elem.ndim == 1:
-                    elem = elem[None, :]  # (1, 7)
-                his_pose_elems.append(elem)
-            his_pose = np.concatenate(his_pose_elems, axis=0)  # (num_history, 7)
-            action_cond = np.concatenate([his_pose, cartesian_poses[traj_idx]], axis=0)  # (num_history+num_frames, 7)
-            his_latent = torch.cat([his_cond_batch[traj_idx][idx] for idx in history_idx], dim=0).unsqueeze(0)  # (1, num_history, 4, 72, 40)
-            current_latent = his_cond_batch[traj_idx][-1]  # (1, 4, 72, 40)
-            
-            action_conds.append(action_cond)
-            current_latents.append(current_latent)
-            his_latents.append(his_latent)
-        
-        # Batched world model forward pass
-        action_cond_batch = np.stack(action_conds, axis=0)
-        current_latent_batch = torch.cat(current_latents, dim=0)
-        his_latent_batch = torch.cat(his_latents, dim=0)
-        text_batch = [task if agent_obj.args.text_cond else None] * batch_size
-        
-        videos_cat_batch, true_videos, video_dict_pred_batch_output, predict_latents = agent_obj.forward_wm(
-            action_cond_batch,
-            None,
-            current_latent_batch,
-            his_cond=his_latent_batch,
-            text=text_batch,
-        )
-        
-        # Update history buffers and collect trajectories
-        for traj_idx in range(batch_size):
-            # Extract latents for this trajectory
-            if batch_size == 1:
-                traj_latents = predict_latents
-            else:
-                traj_latents = [v[traj_idx:traj_idx+1] for v in predict_latents]
-            
-            # Update history
-            joint_update = joint_positions[traj_idx][agent_obj.args.pred_step-1:agent_obj.args.pred_step]
-            his_joint_batch[traj_idx].append(joint_update)
-            
-            cartesian_update = cartesian_poses[traj_idx][agent_obj.args.pred_step-1:agent_obj.args.pred_step]
-            his_eef_batch[traj_idx].append(cartesian_update)
-            
-            # Combine latents
-            if batch_size == 1:
-                combined_latent = torch.cat([v[agent_obj.args.pred_step-1:agent_obj.args.pred_step] for v in traj_latents], dim=2)
-            else:
-                combined_latent = torch.cat([v[0, agent_obj.args.pred_step-1:agent_obj.args.pred_step] for v in traj_latents], dim=2)
-            his_cond_batch[traj_idx].append(combined_latent)
-            
-            # Update video predictions
-            if batch_size == 1:
-                video_dict_pred_batch[traj_idx] = video_dict_pred_batch_output
-            else:
-                video_dict_pred_batch[traj_idx] = [v[traj_idx] for v in video_dict_pred_batch_output]
-            
-            # Store trajectory data (only on first step, or accumulate)
-            # Extract predicted video frames for this step
-            # video_dict_pred_batch_output is a list of 3 arrays (one per camera view)
-            # Each array: (batch_size, num_frames, H, W, 3) or (num_frames, H, W, 3) for batch_size=1
-            if batch_size == 1:
-                # Single batch: each view is (num_frames, H, W, 3)
-                video_view0_step = video_dict_pred_batch_output[0][:agent_obj.args.pred_step-1]  # (pred_step-1, H, W, 3)
-            else:
-                # Batched: each view is (batch_size, num_frames, H, W, 3)
-                video_view0_step = video_dict_pred_batch_output[0][traj_idx, :agent_obj.args.pred_step-1]  # (pred_step-1, H, W, 3)
-            
-            if step == 0:
-                trajectories.append({
-                    "joint_vel": policy_outputs[traj_idx]["joint_vel"].copy(),  # (T, 7)
-                    "predicted_video": [video_view0_step],  # List of (T, H, W, 3) arrays
-                    "joint_pos": policy_outputs[traj_idx]["joint_pos"].copy(),  # (T, 7)
-                    "state_fk": policy_outputs[traj_idx]["state_fk"].copy(),  # (T, 7)
-                })
-            else:
-                # Accumulate trajectory data
-                trajectories[traj_idx]["joint_vel"] = np.concatenate([
-                    trajectories[traj_idx]["joint_vel"],
-                    policy_outputs[traj_idx]["joint_vel"]
-                ], axis=0)
-                trajectories[traj_idx]["joint_pos"] = np.concatenate([
-                    trajectories[traj_idx]["joint_pos"],
-                    policy_outputs[traj_idx]["joint_pos"]
-                ], axis=0)
-                trajectories[traj_idx]["state_fk"] = np.concatenate([
-                    trajectories[traj_idx]["state_fk"],
-                    policy_outputs[traj_idx]["state_fk"]
-                ], axis=0)
-                # Accumulate video frames
-                trajectories[traj_idx]["predicted_video"].append(video_view0_step)
+        # Add trajectories from this batch to the overall list
+        all_trajectories.extend(trajectories)
     
-    # Concatenate all video frames for RFM evaluation
-    # Use view0 (ext_1) for RFM evaluation as per run_rollout_reward_comparison.py
-    for traj_idx in range(batch_size):
-        # Concatenate all accumulated video frames
-        video_frames_list = trajectories[traj_idx]["predicted_video"]
-        video_view0_full = np.concatenate(video_frames_list, axis=0)  # (total_frames, H, W, 3)
-        trajectories[traj_idx]["predicted_video"] = video_view0_full
-    
-    return trajectories
+    return all_trajectories
 
 
 # ============================================================================
@@ -584,6 +617,13 @@ def main() -> None:
         help="Number of trajectories to generate per step",
     )
     parser.add_argument(
+        "--max_batch_size",
+        type=int,
+        default=None,
+        help="Maximum batch size per forward pass. If None, uses num_trajectories. "
+             "If num_trajectories > max_batch_size, runs sequential batches.",
+    )
+    parser.add_argument(
         "--trajectory_length",
         type=int,
         default=1,
@@ -606,6 +646,18 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to PI policy checkpoint",
+    )
+    parser.add_argument(
+        "--svd_model_path",
+        type=str,
+        default=None,
+        help="Path to Stable Video Diffusion model",
+    )
+    parser.add_argument(
+        "--clip_model_path",
+        type=str,
+        default=None,
+        help="Path to CLIP model",
     )
     parser.add_argument(
         "--task_type",
@@ -639,11 +691,25 @@ def main() -> None:
         cfg.ckpt_path = args.ckpt_path
     if args.pi_ckpt:
         cfg.pi_ckpt = args.pi_ckpt
+    if args.svd_model_path:
+        cfg.svd_model_path = args.svd_model_path
+    if args.clip_model_path:
+        cfg.clip_model_path = args.clip_model_path
     
     # Initialize agent
     print("Initializing agent...")
     agent_obj = agent(cfg)
     print("Agent initialized successfully")
+    
+    # Create unique folder for this run
+    run_save_dir = None
+    if args.save_dir:
+        base_save_path = Path(args.save_dir)
+        # Create timestamped folder name
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_save_dir = base_save_path / f"run_{timestamp}"
+        run_save_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Run output directory: {run_save_dir}")
     
     # Connect to server
     print(f"Connecting to server: {args.server_url}")
@@ -660,6 +726,7 @@ def main() -> None:
         # Main loop
         step = 0
         all_rfm_rewards = []
+        all_step_videos = []  # Track videos from all steps for full trajectory
         
         while step < args.max_steps:
             print(f"\n{'='*60}")
@@ -675,6 +742,7 @@ def main() -> None:
                     args.task,
                     args.num_trajectories,
                     args.trajectory_length,
+                    max_batch_size=args.max_batch_size,
                 )
                 print(f"Generated {len(trajectories)} trajectories")
             except Exception as e:
@@ -718,11 +786,12 @@ def main() -> None:
             server_trajectory = trajectory_to_server_format(best_trajectory, args.task)
             
             # Save trajectory if requested
-            if args.save_dir:
+            if run_save_dir:
                 import os
                 import json
-                save_path = Path(args.save_dir)
-                save_path.mkdir(parents=True, exist_ok=True)
+                save_path = run_save_dir
+                
+                # Save JSON trajectory data
                 traj_file = save_path / f"trajectory_step_{step:02d}.json"
                 with open(traj_file, "w") as f:
                     json.dump({
@@ -735,6 +804,23 @@ def main() -> None:
                         },
                     }, f, indent=2)
                 print(f"Saved trajectory to {traj_file}")
+                
+                # Save video for this step
+                if "predicted_video" in best_trajectory and best_trajectory["predicted_video"] is not None:
+                    video_frames = best_trajectory["predicted_video"]
+                    if isinstance(video_frames, np.ndarray) and video_frames.size > 0:
+                        # Ensure video is uint8 and in correct format
+                        if video_frames.dtype != np.uint8:
+                            video_frames = np.clip(video_frames, 0, 255).astype(np.uint8)
+                        
+                        # Save individual step video
+                        step_video_file = save_path / f"trajectory_step_{step:02d}.mp4"
+                        mediapy.write_video(str(step_video_file), video_frames, fps=7)
+                        print(f"Saved step video to {step_video_file}")
+                        
+                        # Add to full trajectory (exclude last frame to avoid duplication with next step)
+                        # We'll determine if this is the last step when concatenating
+                        all_step_videos.append((video_frames, step))
             
             # Execute trajectory
             print("Executing trajectory on server...")
@@ -795,6 +881,26 @@ def main() -> None:
                 break
             
             step += 1
+        
+        # Save full concatenated trajectory video
+        if run_save_dir and all_step_videos:
+            save_path = run_save_dir
+            # Concatenate videos, excluding last frame of each step except the final one
+            video_segments = []
+            for i, (video_frames, step_num) in enumerate(all_step_videos):
+                if i < len(all_step_videos) - 1:
+                    # Not the last step: exclude last frame to avoid duplication
+                    video_segments.append(video_frames[:-1])
+                else:
+                    # Last step: include all frames
+                    video_segments.append(video_frames)
+            
+            if video_segments:
+                full_trajectory_video = np.concatenate(video_segments, axis=0)
+                full_video_file = save_path / "trajectory_full.mp4"
+                mediapy.write_video(str(full_video_file), full_trajectory_video, fps=7)
+                print(f"\nSaved full trajectory video to {full_video_file}")
+                print(f"Full trajectory has {len(full_trajectory_video)} frames")
         
         # Summary
         print(f"\n{'='*60}")

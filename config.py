@@ -53,7 +53,7 @@ class wm_args:
 
     # model parameters
     motion_bucket_id = 127
-    fps = 7
+    fps = 1
     guidance_scale = 2 #7.5 #7.5 #7.5 #3.0
     num_inference_steps = 50
     decode_chunk_size = 7
@@ -122,7 +122,7 @@ class wm_args:
         #     self.ineraction_num = 7
 
         elif self.task_type == "pickplace":
-            self.interact_num = 5
+            self.interact_num = 20
             self.val_dataset_dir = "dataset_example/my_droid"
             self.val_id = ['scene_1']
             self.start_idx = [0] * len(self.val_id)
