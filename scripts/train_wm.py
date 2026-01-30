@@ -19,7 +19,7 @@ import json
 from decord import VideoReader, cpu
 import wandb
 import swanlab
-import mediapy
+import imageio
 from models.ctrl_world import CrtlWorld
 from config import wm_args
 import math
@@ -235,7 +235,7 @@ def validate_video_generation(model, val_dataset, args, train_steps, videos_dir,
     
     os.makedirs(f"{videos_dir}/samples", exist_ok=True)
     filename = f"{videos_dir}/samples/train_steps_{train_steps}_{id}.mp4"
-    mediapy.write_video(filename, videos, fps=2)
+    imageio.mimwrite(filename, videos, fps=2, codec="libx264")
     return 
 
 

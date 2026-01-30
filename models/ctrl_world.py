@@ -16,7 +16,6 @@ import json
 from decord import VideoReader, cpu
 import wandb
 import swanlab
-import mediapy
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):

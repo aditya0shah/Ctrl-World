@@ -9,6 +9,9 @@ evaluates each with RFM rewards, selects the best one, and sends it to the serve
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
+import multiprocessing as mp
+import os
 import pickle
 import socket
 import struct
@@ -41,6 +44,76 @@ from use_reward_eval_server import (
     make_progress_sample,
     post_evaluate_batch_npy,
 )
+
+# ============================================================================
+# Multiprocess trajectory generation (no batching)
+# ============================================================================
+
+# NOTE: These globals are initialized inside worker processes via _mp_init_worker().
+_MP_AGENT_OBJ = None
+_MP_TASK = None
+_MP_TRAJECTORY_LENGTH = None
+
+
+def _mp_init_worker(
+    cfg: Any,
+    task: str,
+    trajectory_length: int,
+    gpu_ids: Optional[List[int]] = None,
+    worker_rank: Optional[Any] = None,
+) -> None:
+    """
+    Worker initializer: constructs the agent once per process.
+
+    We keep the agent instance in a process-global so we don't reload weights for every trajectory.
+    When gpu_ids and worker_rank are provided, sets CUDA_VISIBLE_DEVICES so this process uses
+    gpu_ids[worker_rank] (for multi-GPU parallelism).
+    """
+    global _MP_AGENT_OBJ, _MP_TASK, _MP_TRAJECTORY_LENGTH
+    if gpu_ids is not None and worker_rank is not None:
+        gpu_id = gpu_ids[worker_rank]
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    _MP_TASK = task
+    _MP_TRAJECTORY_LENGTH = trajectory_length
+    _MP_AGENT_OBJ = agent(cfg)
+
+
+def _mp_init_worker_multi_gpu(
+    cfg: Any,
+    task: str,
+    trajectory_length: int,
+    gpu_ids: List[int],
+    counter: Any,
+    lock: Any,
+) -> None:
+    """Wrapper initializer: assigns this process a GPU via shared counter, then inits agent."""
+    with lock:
+        worker_rank = counter.value
+        counter.value += 1
+    _mp_init_worker(
+        cfg,
+        task,
+        trajectory_length,
+        gpu_ids=gpu_ids,
+        worker_rank=worker_rank,
+    )
+
+
+def _mp_generate_one(scene_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Worker job: generate exactly 1 trajectory from scene_data.
+    """
+    global _MP_AGENT_OBJ, _MP_TASK, _MP_TRAJECTORY_LENGTH
+    if _MP_AGENT_OBJ is None:
+        raise RuntimeError("Worker agent not initialized. This should not happen.")
+    trajs = generate_trajectories(
+        _MP_AGENT_OBJ,
+        scene_data,
+        _MP_TASK,
+        num_trajectories=1,
+        trajectory_length=_MP_TRAJECTORY_LENGTH,
+    )
+    return trajs[0]
 
 
 # ============================================================================
@@ -430,6 +503,58 @@ def generate_trajectories(
     return trajectories
 
 
+def generate_trajectories_multiprocess(
+    cfg: Any,
+    scene_data: Dict[str, Any],
+    task: str,
+    num_trajectories: int,
+    trajectory_length: int,
+    mp_workers: int,
+    mp_start_method: str = "spawn",
+    gpu_ids: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Generate N trajectories concurrently using N separate processes (no batching).
+
+    This is intentionally different from the default batched mode:
+    - Each worker process has its own agent/model instance
+    - Each worker generates exactly 1 trajectory
+    - Parallelism scales with mp_workers (typically set = num_trajectories)
+    - If gpu_ids is provided, workers are assigned one GPU each (gpu_ids[worker_rank])
+    """
+    if num_trajectories <= 0:
+        return []
+    if mp_workers <= 0:
+        mp_workers = num_trajectories
+    mp_workers = min(mp_workers, num_trajectories)
+    if gpu_ids is not None and len(gpu_ids) < mp_workers:
+        mp_workers = len(gpu_ids)
+
+    # With CUDA + multiprocessing, spawn is the safest default.
+    ctx = mp.get_context(mp_start_method)
+
+    if gpu_ids is not None:
+        counter = ctx.Value("i", 0)
+        lock = ctx.Lock()
+        initializer = _mp_init_worker_multi_gpu
+        initargs = (cfg, task, trajectory_length, gpu_ids, counter, lock)
+    else:
+        initializer = _mp_init_worker
+        initargs = (cfg, task, trajectory_length)
+
+    with cf.ProcessPoolExecutor(
+        max_workers=mp_workers,
+        mp_context=ctx,
+        initializer=initializer,
+        initargs=initargs,
+    ) as ex:
+        futures = [ex.submit(_mp_generate_one, scene_data) for _ in range(num_trajectories)]
+        # Wait for all in submission order so trajectories are deterministic and we only eval after all are done.
+        trajectories = [fut.result() for fut in futures]
+
+    return trajectories
+
+
 # ============================================================================
 # RFM Evaluation Module
 # ============================================================================
@@ -590,6 +715,38 @@ def main() -> None:
         help="Length of each trajectory in interaction steps",
     )
     parser.add_argument(
+        "--generation_backend",
+        type=str,
+        default="batched",
+        choices=["batched", "mp"],
+        help="How to generate candidate trajectories: "
+        "'batched' runs one GPU-batched forward pass; "
+        "'mp' runs separate processes concurrently (no batching).",
+    )
+    parser.add_argument(
+        "--mp_workers",
+        type=int,
+        default=0,
+        help="Number of worker processes when --generation_backend mp. "
+        "0 means use --num_trajectories.",
+    )
+    parser.add_argument(
+        "--mp_start_method",
+        type=str,
+        default="spawn",
+        choices=["spawn", "forkserver", "fork"],
+        help="Multiprocessing start method for --generation_backend mp. "
+        "Use 'spawn' for best CUDA safety.",
+    )
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs for multi-GPU multiprocessing (e.g. '0,1,2,3,4'). "
+        "When set with --generation_backend mp, each worker uses one GPU. "
+        "If unset, workers share the default GPU(s) from the environment.",
+    )
+    parser.add_argument(
         "--max_steps",
         type=int,
         default=12,
@@ -632,6 +789,11 @@ def main() -> None:
     )
     
     args = parser.parse_args()
+
+    # Parse --gpu_ids for multi-GPU multiprocessing
+    gpu_ids: Optional[List[int]] = None
+    if args.gpu_ids:
+        gpu_ids = [int(x.strip()) for x in args.gpu_ids.split(",")]
     
     # Initialize config
     cfg = wm_args(task_type=args.task_type)
@@ -642,8 +804,16 @@ def main() -> None:
     
     # Initialize agent
     print("Initializing agent...")
-    agent_obj = agent(cfg)
-    print("Agent initialized successfully")
+    agent_obj = None
+    if args.generation_backend == "batched":
+        agent_obj = agent(cfg)
+        print("Agent initialized successfully")
+    else:
+        # In multiprocess mode, each worker initializes its own agent.
+        if gpu_ids is not None:
+            print(f"Multiprocess generation mode: {len(gpu_ids)} GPU(s) {gpu_ids}")
+        else:
+            print("Multiprocess generation mode: workers will initialize agents")
     
     # Connect to server
     print(f"Connecting to server: {args.server_url}")
@@ -669,13 +839,25 @@ def main() -> None:
             # Generate trajectories
             print(f"Generating {args.num_trajectories} trajectories...")
             try:
-                trajectories = generate_trajectories(
-                    agent_obj,
-                    scene_data,
-                    args.task,
-                    args.num_trajectories,
-                    args.trajectory_length,
-                )
+                if args.generation_backend == "batched":
+                    trajectories = generate_trajectories(
+                        agent_obj,
+                        scene_data,
+                        args.task,
+                        args.num_trajectories,
+                        args.trajectory_length,
+                    )
+                else:
+                    trajectories = generate_trajectories_multiprocess(
+                        cfg=cfg,
+                        scene_data=scene_data,
+                        task=args.task,
+                        num_trajectories=args.num_trajectories,
+                        trajectory_length=args.trajectory_length,
+                        mp_workers=args.mp_workers,
+                        mp_start_method=args.mp_start_method,
+                        gpu_ids=gpu_ids,
+                    )
                 print(f"Generated {len(trajectories)} trajectories")
             except Exception as e:
                 print(f"Error generating trajectories: {e}")

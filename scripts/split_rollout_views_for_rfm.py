@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-import mediapy
+import imageio
 
 try:
     from decord import VideoReader, cpu
@@ -127,7 +127,7 @@ def split_video(
         view = base[:, :, i * view_w : (i + 1) * view_w, :].copy()  # (T, view_h, view_w, C)
         out_name = f"{stem}_view{i}.mp4"
         out_path = out_dir / out_name
-        mediapy.write_video(str(out_path), view, fps=out_fps)
+        imageio.mimwrite(str(out_path), view, fps=out_fps, codec="libx264")
         out_paths.append(out_path)
 
     return out_paths

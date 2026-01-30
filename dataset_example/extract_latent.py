@@ -1,12 +1,10 @@
-import mediapy
+import imageio
 import os
 from diffusers.models import AutoencoderKL
-import mediapy
 import torch
 import numpy as np
 import json
 from diffusers.models import AutoencoderKL,AutoencoderKLTemporalDecoder
-import mediapy
 from torch.utils.data import Dataset
 
 import pandas as pd
@@ -93,14 +91,14 @@ class EncodeLatentDataset(Dataset):
     def process_traj(self, video_paths, traj_info, instruction, save_root,traj_id=0,data_type='val', size=(192,320), rgb_skip=3, device='cuda'):
         for video_id, video_path in enumerate(video_paths):
             # load and resize video and save
-            video = mediapy.read_video(video_path)
+            video = np.asarray(imageio.mimread(video_path))  # (T, H, W, C)
             frames = torch.tensor(video).permute(0, 3, 1, 2).float() / 255.0*2-1
             frames = frames[::rgb_skip]  # Skip frames to save memory here!!!
             x = torch.nn.functional.interpolate(frames, size=size, mode='bilinear', align_corners=False)
             resize_video = ((x / 2.0 + 0.5).clamp(0, 1)*255)
             resize_video = resize_video.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
             os.makedirs(f"{save_root}/videos/{data_type}/{traj_id}", exist_ok=True)
-            mediapy.write_video(f"{save_root}/videos/{data_type}/{traj_id}/{video_id}.mp4", resize_video, fps=5)
+            imageio.mimwrite(f"{save_root}/videos/{data_type}/{traj_id}/{video_id}.mp4", resize_video, fps=5, codec="libx264")
 
             # save svd latent
             x = x.to(device)

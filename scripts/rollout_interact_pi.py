@@ -25,7 +25,7 @@ import wandb
 import json
 from decord import VideoReader, cpu
 import swanlab
-import mediapy
+import imageio
 import sys
 from scipy.spatial.transform import Rotation as R
 
@@ -63,7 +63,7 @@ class agent():
         # load ctrl-world model
 
         self.model = CrtlWorld(args)
-        self.model.load_state_dict(torch.load(args.val_model_path))
+        self.model.load_state_dict(torch.load(args.val_model_path, map_location="cpu"))
         self.model.to(self.accelerator.device).to(self.dtype)
         self.model.eval()
         
@@ -648,6 +648,8 @@ if __name__ == "__main__":
     parser.add_argument('--pi_ckpt', type=str, default=None)
     parser.add_argument('--save_dir', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=1, help='Number of parallel trajectories to run from same initial state')
+    parser.add_argument('--trajectory_index', type=int, default=None, help='Index of this trajectory when running y parallel trajectories (0-based)')
+    parser.add_argument('--num_trajectories', type=int, default=None, help='Total number of parallel trajectories (y) when using multi-GPU rollout')
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -659,6 +661,20 @@ if __name__ == "__main__":
         return cfg
 
     args = merge_args(args, args_new)
+
+    # Expand (val_id, instruction, start_idx) when num_trajectories > n scenes, then optionally slice to trajectory_index
+    n = len(args.val_id)
+    if getattr(args, 'num_trajectories', None) is not None and args.num_trajectories > n:
+        rep = (args.num_trajectories + n - 1) // n
+        args.val_id = (args.val_id * rep)[:args.num_trajectories]
+        args.instruction = (args.instruction * rep)[:args.num_trajectories]
+        args.start_idx = (args.start_idx * rep)[:args.num_trajectories]
+    if getattr(args, 'trajectory_index', None) is not None:
+        i = args.trajectory_index
+        assert 0 <= i < len(args.val_id), f"trajectory_index {i} out of range [0, {len(args.val_id)})"
+        args.val_id = [args.val_id[i]]
+        args.instruction = [args.instruction[i]]
+        args.start_idx = [args.start_idx[i]]
     
     # Debug: print the pi_ckpt value being used
     print(f"Using pi_ckpt: {args.pi_ckpt}")
@@ -910,9 +926,14 @@ if __name__ == "__main__":
         
         for traj_idx in range(batch_size):
             video = np.concatenate(video_to_save_batch[traj_idx], axis=0)
-            filename_video = f"{args.save_dir}/{args.task_name}/video/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{args.policy_skip_step}_{text_id}_batch{traj_idx}.mp4"
+            run_id = args.trajectory_index if getattr(args, 'trajectory_index', None) is not None else traj_idx
+            suffix = f"run{run_id}" if getattr(args, 'trajectory_index', None) is not None else f"batch{traj_idx}"
+            filename_video = f"{args.save_dir}/{args.task_name}/video/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{args.policy_skip_step}_{text_id}_{suffix}.mp4"
             os.makedirs(os.path.dirname(filename_video), exist_ok=True)
-            mediapy.write_video(filename_video, video, fps=4)
+            # Use imageio + imageio-ffmpeg (bundled ffmpeg, no system install needed)
+            if video.dtype in (np.float32, np.float64):
+                video = (np.clip(video, 0, 1) * 255).astype(np.uint8)
+            imageio.mimwrite(filename_video, video, fps=4, codec="libx264")
             print(f"Saving video for trajectory {traj_idx} to {filename_video}")
             
             info = {'success': 1, 'start_idx': 0, 'end_idx': video.shape[0]-1, 'instructions': text_i, 'batch_idx': traj_idx}
@@ -923,7 +944,7 @@ if __name__ == "__main__":
                         info[key] += info_to_save_batch[traj_idx][i][key].tolist()
             
             # save to json
-            filename_info = f"{args.save_dir}/{args.task_name}/info/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{pred_step}_{text_id}_batch{traj_idx}.json"
+            filename_info = f"{args.save_dir}/{args.task_name}/info/{args.task_type}_time_{uuid}_traj_{val_id_i}_{start_idx_i}_{pred_step}_{text_id}_{suffix}.json"
             os.makedirs(os.path.dirname(filename_info), exist_ok=True)
             with open(filename_info, 'w') as f:
                 json.dump(info, f, indent=4)
