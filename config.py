@@ -8,9 +8,9 @@ from dataclasses import dataclass
 class wm_args:
     ########################### training args ##############################
     # model paths
-    svd_model_path = "/cephfs/shared/llm/stable-video-diffusion-img2vid"
-    clip_model_path = "/cephfs/shared/llm/clip-vit-base-patch32"
-    ckpt_path = '/cephfs/cjyyj/code/video_evaluation/output2/exp33_210_s11/checkpoint-10000.pt'
+    svd_model_path = "checkpoints/stable-video-diffusion-img2vid"
+    clip_model_path = "checkpoints/clip-vit-base-patch32"
+    ckpt_path = 'checkpoints/Ctrl-World/checkpoint-10000.pt'
     pi_ckpt = 'gs://openpi-assets/checkpoints/pi05_droid'  # GCS path - will auto-download to ~/.cache/openpi
 
     # dataset parameters
@@ -101,8 +101,30 @@ class wm_args:
         # Configure per-task eval sets
         if self.task_type == "replay":
             self.val_dataset_dir = "dataset_example/droid_subset"
-            self.val_id = ["899", "18599","199",]
-            self.start_idx = [8, 14, 8] * len(self.val_id)
+            # Available trajectory IDs in val set with video lengths:
+            #   899  = 121 frames (0-120)
+            #   18599 = 72 frames (0-71)
+            #   199  = 33 frames (0-32)
+            #   1799 = 41 frames (0-40)
+            # Available trajectory IDs in train set with video lengths:
+            #   0 = 56 frames (0-55)
+            #   1 = 89 frames (0-88)
+            #   2 = 137 frames (0-136)
+            #   3 = 80 frames (0-79)
+            #   4 = 124 frames (0-123)
+            #   5 = 62 frames (0-61)
+            #   6 = 39 frames (0-38)
+            # Change these to select different videos. Each ID corresponds to:
+            # - Annotation file: annotation/{split}/{id}.json (use --split train or val)
+            # - Videos: videos/{split}/{id}/0.mp4, videos/{split}/{id}/1.mp4, videos/{split}/{id}/2.mp4
+            # Using all training trajectories (0-6)
+            self.val_id = ["0", "1", "2", "3", "4", "5", "6"]
+            # Starting frame index for each trajectory (must match length of val_id)
+            # Ensure: start_idx + (pred_step * interact_num + 8) <= video_length
+            # Current: pred_step=5, interact_num=12 → extracts 68 frames total
+            # Training video lengths: 0=56, 1=89, 2=137, 3=80, 4=124, 5=62, 6=39 frames
+            # Starting from frame 0 for all trajectories
+            self.start_idx = [0, 0, 0, 0, 0, 0, 0]
             self.instruction = [""] * len(self.val_id)
             self.task_name = "Rollouts_replay"
 

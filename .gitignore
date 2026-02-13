@@ -13,3 +13,6 @@ dataset_example/droid_subset/annotation/val_old*
 checkpoints/
 benchmark*
 video
+franka-data/
+noisy_eval_out/
+logs/

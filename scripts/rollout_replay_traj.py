@@ -59,9 +59,10 @@ class agent():
         #     raise ValueError(f"Unknown policy type: {args.policy_type}")
         # self.policy = policy_config.create_trained_policy(config, checkpoint_dir)
 
-        # load ctrl-world model        
+        # load ctrl-world model
+        # map_location handles checkpoints saved on CUDA when loading on different device
         self.model = CrtlWorld(args)
-        self.model.load_state_dict(torch.load(args.val_model_path))
+        self.model.load_state_dict(torch.load(args.val_model_path, map_location=self.accelerator.device))
         self.model.to(self.accelerator.device).to(self.dtype)
         self.model.eval()
         print("load world model success")
@@ -83,12 +84,12 @@ class agent():
         ndata = 2 * (data - data_min) / (data_max - data_min + eps) - 1
         return np.clip(ndata, clip_min, clip_max)
 
-    def get_traj_info(self, id, start_idx=0, steps=8):
+    def get_traj_info(self, id, start_idx=0, steps=8, split='val'):
         val_dataset_dir = self.args.val_dataset_dir
         args = self.args
         skip = args.skip_step
         num_frames = steps
-        annotation_path = f"{val_dataset_dir}/annotation/val/{id}.json"
+        annotation_path = f"{val_dataset_dir}/annotation/{split}/{id}.json"
         with open(annotation_path) as f:
             anno = json.load(f)
             try:
@@ -104,8 +105,19 @@ class agent():
         instruction = anno['texts'][0]
         car_action = np.array(anno['states'])
         car_action = car_action[frames_ids]
-        joint_pos = np.array(anno['joints'])
-        joint_pos = joint_pos[frames_ids]
+        
+        # Handle both 'joints' and 'states' (some datasets only have states)
+        if 'joints' in anno:
+            joint_pos = np.array(anno['joints'])
+            joint_pos = joint_pos[frames_ids]
+        else:
+            # Use states as joint positions if joints not available
+            # Pad to 8 dimensions if needed (states are 7D, joints are 8D)
+            joint_pos = np.array(anno['states'])
+            if joint_pos.shape[-1] == 7:
+                # Add an extra dimension (set to 0 for gripper joint)
+                joint_pos = np.pad(joint_pos, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+            joint_pos = joint_pos[frames_ids]
 
         # get videos
         video_dict =[]
@@ -141,16 +153,24 @@ class agent():
         
         return car_action, joint_pos, video_dict, video_latent, instruction
 
-    def forward_wm(self, action_cond, video_latent_true, video_latent_cond, his_cond=None, text=None):
+    def forward_wm(self, action_cond, video_latent_true, video_latent_cond, his_cond=None, text=None, 
+                   action_noise=0.0, latent_noise=0.0, num_inference_steps_override=None):
         args = self.args
         image_cond = video_latent_cond
 
+        # Add action noise BEFORE normalization (simulates state estimation error)
+        if action_noise > 0.0:
+            noise = np.random.randn(*action_cond.shape) * action_noise
+            action_cond = action_cond + noise
+            
         # action should be normed
         action_cond = self.normalize_bound(action_cond, self.state_p01, self.state_p99, clip_min=-1, clip_max=1)
         action_cond = torch.tensor(action_cond).unsqueeze(0).to(self.device).to(self.dtype)
         assert image_cond.shape[1:] == (4, 72, 40)
         assert action_cond.shape[1:] == (args.num_frames+args.num_history, args.action_dim)
 
+        # Use override inference steps if provided
+        inference_steps = num_inference_steps_override if num_inference_steps_override is not None else args.num_inference_steps
 
         # predict future frames
         with torch.no_grad():
@@ -169,7 +189,7 @@ class agent():
                 height=int(args.height*3),
                 num_frames=args.num_frames,
                 history=his_cond,
-                num_inference_steps=args.num_inference_steps,
+                num_inference_steps=inference_steps,
                 decode_chunk_size=args.decode_chunk_size,
                 max_guidance_scale=args.guidance_scale,
                 fps=args.fps,
@@ -180,6 +200,11 @@ class agent():
                 frame_level_cond=True,
             )
         latents = einops.rearrange(latents, 'b f c (m h) (n w) -> (b m n) f c h w', m=3,n=1) # (B, 8, 4, 32,32)
+        
+        # Add latent noise AFTER generation (direct quality degradation)
+        if latent_noise > 0.0:
+            noise = torch.randn_like(latents) * latent_noise
+            latents = latents + noise
 
 
         # decode ground truth video
@@ -229,6 +254,16 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_meta_info_path', type=str, default=None)
     parser.add_argument('--dataset_names', type=str, default=None)
     parser.add_argument('--task_type', type=str, default='replay')
+    parser.add_argument('--val_id', type=str, default=None, help='Trajectory ID to replay')
+    parser.add_argument('--start_idx', type=int, default=None, help='Start frame index')
+    parser.add_argument('--split', type=str, default='val', choices=['train', 'val'], help='Dataset split (train or val)')
+    parser.add_argument('--interact_num', type=int, default=None, help='Number of interactions (will auto-calculate for full video if not set)')
+    # Noise injection parameters
+    parser.add_argument('--action_noise', type=float, default=0.0, help='Gaussian noise std for action perturbation (0.0 = no noise)')
+    parser.add_argument('--latent_noise', type=float, default=0.0, help='Gaussian noise std for latent space perturbation (0.0 = no noise)')
+    parser.add_argument('--num_inference_steps', type=int, default=None, help='Override diffusion steps. Use -1 for video_length (full length per video)')
+    parser.add_argument('--noise_config', type=str, default=None, help='Noise config name for output filename')
+    parser.add_argument('--repeat_id', type=int, default=None, help='Repeat/sample ID for generating multiple samples per (task, noise)')
     args_new = parser.parse_args()
 
     args = wm_args(task_type=args_new.task_type)
@@ -241,18 +276,69 @@ if __name__ == "__main__":
     
     args = merge_args(args, args_new)
 
+    # Override val_id, start_idx, and val_dataset_dir if provided via command line
+    if args_new.val_id is not None:
+        args.val_id = [args_new.val_id]
+    if args_new.start_idx is not None:
+        args.start_idx = [args_new.start_idx]
+    if args_new.split is not None:
+        # Update dataset directory to use the correct split
+        base_dir = args.val_dataset_dir.split('/annotation')[0] if '/annotation' in args.val_dataset_dir else args.val_dataset_dir
+        args.val_dataset_dir = f"{args.dataset_root_path}/{args.dataset_names}"
+    
+    # Ensure instruction list matches
+    if hasattr(args, 'val_id'):
+        args.instruction = [""] * len(args.val_id)
+
+    # Store noise parameters
+    action_noise = args_new.action_noise if args_new.action_noise is not None else 0.0
+    latent_noise = args_new.latent_noise if args_new.latent_noise is not None else 0.0
+    num_inference_steps_override = args_new.num_inference_steps  # Can be None
+    noise_config = args_new.noise_config if args_new.noise_config else f"an{action_noise}_ln{latent_noise}_steps{num_inference_steps_override or 'default'}"
+    
+    print(f"Noise config: {noise_config}")
+    print(f"  Action noise: {action_noise}")
+    print(f"  Latent noise: {latent_noise}")
+    print(f"  Inference steps: {num_inference_steps_override or 'default (50)'}")
+    import os
+    cuda_dev = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+    print(f"  CUDA_VISIBLE_DEVICES={cuda_dev} (physical GPU index)")
+
     # create rollout agent
     Agent = agent(args)
-    interact_num = args.interact_num
     pred_step = args.pred_step
     num_history = args.num_history
     num_frames = args.num_frames
     print(f'rollout with {args.task_type}')
-
+    
+    # Get split from args (default to 'val' for backward compatibility)
+    split = getattr(args, 'split', 'val')
 
     for val_id_i, text_i, start_idx_i in zip(args.val_id, args.instruction, args.start_idx):
+        # Read annotation for video length (needed for interact_num and/or inference steps)
+        annotation_path = f"{args.val_dataset_dir}/annotation/{split}/{val_id_i}.json"
+        with open(annotation_path) as f:
+            anno = json.load(f)
+            video_length = anno.get("video_length", len(anno.get("states", [])))
+
+        # Auto-calculate interact_num for full video if not specified
+        if args_new.interact_num is not None:
+            interact_num = args_new.interact_num
+        else:
+            # Formula: (interact_num * (pred_step - 1)) + pred_step >= video_length - start_idx_i
+            remaining_frames = video_length - start_idx_i
+            interact_num = max(1, int(np.ceil((remaining_frames - pred_step) / (pred_step - 1))) + 1)
+            print(f"Auto-calculated interact_num={interact_num} for video_length={video_length}, start_idx={start_idx_i}")
+
+        # Per-vide o inference steps: -1 means use video_length (entire video)
+        if num_inference_steps_override == -1:
+            steps_for_video = video_length
+            print(f"Using inference_steps={steps_for_video} (video_length for full video)")
+        else:
+            steps_for_video = num_inference_steps_override
+        
         # read ground truth trajectory informations
-        eef_gt, joint_pos_gt, video_dict, video_latents, instruction = Agent.get_traj_info(val_id_i, start_idx=start_idx_i, steps=int(pred_step*interact_num+8))
+        eef_gt, joint_pos_gt, video_dict, video_latents, instruction = Agent.get_traj_info(val_id_i, start_idx=start_idx_i, steps=int(pred_step*interact_num+8), split=split)
         text_i = instruction
         print("text_i:",instruction, "eef pose at t=0", eef_gt[0], "joint at t=0", joint_pos_gt[0])
 
@@ -306,7 +392,14 @@ if __name__ == "__main__":
             assert action_cond.shape == (int(num_history+num_frames), 7), f"Expected action_cond shape ({int(num_history+num_frames)}, 7), got {action_cond.shape}"
             assert his_cond_input.shape == (1, int(num_history), 4, 72, 40), f"Expected his_cond_input shape (1, {int(num_history)}, 72, 40), got {his_cond_input.shape}"
             # forward world model
-            videos_cat, true_videos, video_dict_pred, predicted_latents = Agent.forward_wm(action_cond, video_latent_true, current_latent, his_cond=his_cond_input,text=text_i if Agent.args.text_cond else None)
+            videos_cat, true_videos, video_dict_pred, predicted_latents = Agent.forward_wm(
+                action_cond, video_latent_true, current_latent, 
+                his_cond=his_cond_input,
+                text=text_i if Agent.args.text_cond else None,
+                action_noise=action_noise,
+                latent_noise=latent_noise,
+                num_inference_steps_override=steps_for_video
+            )
 
             print("################ record information ################")
             # push current step to history buffer
@@ -325,7 +418,9 @@ if __name__ == "__main__":
         videos_dir = args.val_model_path.split('/')[:-1]
         videos_dir = '/'.join(videos_dir)
         uuid = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename_video = f"{args.save_dir}/{task_name}/video/time_{uuid}_traj_{val_id_i}_{start_idx_i}_{pred_step}_{text_id}.mp4"
+        # Include noise config and optional repeat_id in filename
+        repeat_suffix = f"_rep{args_new.repeat_id}" if args_new.repeat_id is not None else ""
+        filename_video = f"{args.save_dir}/{task_name}/video/{noise_config}/time_{uuid}_traj_{split}_{val_id_i}_{start_idx_i}_{text_id}{repeat_suffix}.mp4"
         os.makedirs(os.path.dirname(filename_video), exist_ok=True)
         if video.dtype in (np.float32, np.float64):
             video = (np.clip(video, 0, 1) * 255).astype(np.uint8)
